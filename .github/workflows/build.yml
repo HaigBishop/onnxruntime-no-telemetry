@@ -71,7 +71,7 @@ jobs:
     # Windows SDK (10.0.26100.0) are what Microsoft's library was built with.
     # windows-2025 has moved to Visual Studio 2026.
     runs-on: windows-2022
-    timeout-minutes: 300
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash

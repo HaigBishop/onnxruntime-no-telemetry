@@ -12,7 +12,7 @@ ONNX Runtime's API cannot undo that. `DisableTelemetryEvents` sets a flag of ONN
 
 Microsoft's release pipeline turns its telemetry on with `--use_telemetry`, which puts the provider in Microsoft's telemetry provider group. A build from source without the flag leaves the provider out of the group but still registers it under the same ID, which is all Windows' listener needs. So leaving out the flag is not enough.
 
-Checked on Windows 11 Pro on 2026-11-17: the listener names the provider, and in a process that made an environment with Microsoft's 1.28.3 library, Windows' session enabled it at once and kept it enabled after `DisableTelemetryEvents`.
+Checked on Windows 11 Pro on 2026-11-17: the listener names the provider, and in a process that made an environment with Microsoft's 1.28.3 library, Windows' session enabled it at once and kept it enabled after `DisableTelemetryEvents`. On the Windows Server 2022 runner that built 1.28.3 here, the session asked for every one of Microsoft's telemetry keywords (`0xe00000000000`).
 
 ## What differs from Microsoft's release
 
@@ -36,15 +36,15 @@ Before a release is published, the workflow holds the library to Microsoft's own
 - **No telemetry provider:** [check-telemetry.py](https://github.com/HaigBishop/onnxruntime-no-telemetry/blob/main/check-telemetry.py) loads the library into a process of its own, makes an environment and asks Windows whether the provider is registered in that process. In this build it must not be, and in Microsoft's it must be, which shows the check would see it.
 - **Built as Microsoft's is:** the library was linked by the same MSVC and imports the same libraries as Microsoft's, which a change of toolchain or configuration would show, and its version information names PetriScan Limited.
 
-The release notes name the run that built it, its MSVC and the runner image.
+The release notes name the run that built it, its MSVC and the runner image. PetriScan Desktop also holds a build to Microsoft's on its own models before pinning it, and 1.28.3 gave Microsoft's detections bit for bit, at the same speed, on an i5-1145G7.
 
 ## Building a version
 
 1. At Microsoft's tag for the version, compare the command in `win-ci.yml` and `c-api-cpu.yml`, the tool versions in `tools/ci_build/run_gh_action.py`, and the toolchain Microsoft's library names (its linker version, and the MSVC and Windows SDK paths in its PDB) with this workflow's, and bring the workflow in line.
-2. Run `gh workflow run build.yml -R HaigBishop/onnxruntime-no-telemetry -f version=<version>`. It refuses a version that already has a release, and fails if `windows.patch` no longer applies.
+2. Run `gh workflow run build.yml -R HaigBishop/onnxruntime-no-telemetry -f version=<version>`. It refuses a version that already has a release, and fails if `windows.patch` no longer applies. 1.28.3 took half an hour, 12 minutes of it vcpkg building the dependencies.
 3. PetriScan Desktop then pins the SHA-256 of the archive and of the library from the release notes in its `src-tauri/build.rs`, once its own checks agree.
 
-**Past 1.28,** Microsoft's builds on every platform carry a 1DS telemetry client that uploads over HTTPS, and a build from source includes it unless `--no_telemetry` is passed. A version past 1.28 adds that flag, takes a fresh look at `windows.patch` and `check-telemetry.py`, and builds for macOS and Linux as well.
+**Past 1.28,** Microsoft's builds carry a 1DS telemetry client that uploads over HTTPS, on macOS and Linux from 1.29 and on Windows from 1.31, and a build from source includes it unless `--no_telemetry` is passed. A version past 1.28 adds that flag, takes a fresh look at `windows.patch` and `check-telemetry.py`, and builds for macOS and Linux as well.
 
 ## Licence
 
