@@ -1,0 +1,234 @@
+# Builds Microsoft's ONNX Runtime for Windows x64 from its source with its
+# release flags, less its telemetry, and publishes it as a release of this
+# repository (README.md). Dispatched by hand, once for each version:
+#
+#   gh workflow run build.yml -f version=1.28.3
+#
+# The gate resolves Microsoft's tag for the version to its commit, and refuses a
+# version that already has a release here, so a published build never changes
+# under the hashes PetriScan Desktop pins. The build checks out that commit,
+# applies windows.patch and runs Microsoft's own command for its Windows CPU
+# release, on the runner image with Microsoft's toolchain. Then it holds the
+# library to Microsoft's release: built from the commit Microsoft's signed
+# archive names, with the same linker and imports, and without the telemetry
+# provider Microsoft's registers (check-telemetry.py). Only then does publish
+# make the release.
+#
+# The build runs third-party code, ONNX Runtime's own and every dependency's, so
+# its token can only read and its checkouts keep no credentials. Publish, which
+# runs none, is the one job that can write to this repository. There are no
+# secrets.
+
+name: Build
+run-name: Build ONNX Runtime ${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: ONNX Runtime version, as Microsoft tags it without the v, such as 1.28.3
+        required: true
+        type: string
+
+# One build of a version at a time. A second dispatch queues, never interleaves.
+concurrency:
+  group: build-${{ inputs.version }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      commit: ${{ steps.release.outputs.commit }}
+    steps:
+      - name: Resolve the version to Microsoft's commit
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Refusing: $VERSION is not a version such as 1.28.3."; exit 1; }
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Refusing: ONNX Runtime $VERSION already has a release here, and a release is never replaced."
+            exit 1
+          fi
+          gh release view "v$VERSION" --repo microsoft/onnxruntime --json assets --jq '.assets[].name' \
+            | grep -qx "onnxruntime-win-x64-$VERSION.zip" \
+            || { echo "Refusing: Microsoft's release v$VERSION has no onnxruntime-win-x64-$VERSION.zip."; exit 1; }
+          commit=$(gh api "repos/microsoft/onnxruntime/commits/v$VERSION" --jq .sha)
+          echo "Building ONNX Runtime $VERSION from Microsoft's $commit."
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: gate
+    # Windows Server 2022, whose Visual Studio 2022 (17.14, MSVC 14.44) and
+    # Windows SDK (10.0.26100.0) are what Microsoft's library was built with.
+    # windows-2025 has moved to Visual Studio 2026.
+    runs-on: windows-2022
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+      COMMIT: ${{ needs.gate.outputs.commit }}
+      ARCHIVE: onnxruntime-win-x64-${{ needs.gate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Check out Microsoft's source at the release's commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: microsoft/onnxruntime
+          ref: ${{ needs.gate.outputs.commit }}
+          path: onnxruntime
+          persist-credentials: false
+
+      # Microsoft's own archive, read by Windows' tar, which opens zip files, to
+      # hold this build to: signed by Microsoft and built from this commit.
+      - name: Fetch Microsoft's release
+        run: |
+          curl --fail --location --silent --show-error --output microsoft.zip \
+            "https://github.com/microsoft/onnxruntime/releases/download/v$VERSION/$ARCHIVE.zip"
+          mkdir microsoft
+          "$(cygpath -u "$SYSTEMROOT")/System32/tar.exe" -xf microsoft.zip -C microsoft
+          built_from=$(tr -d ' \r\n' < "microsoft/$ARCHIVE/GIT_COMMIT_ID")
+          [ "$built_from" = "$COMMIT" ] || { echo "Microsoft's archive was built from $built_from, not $COMMIT."; exit 1; }
+      - name: Check Microsoft's library is signed by Microsoft
+        shell: pwsh
+        run: |
+          $signature = Get-AuthenticodeSignature "microsoft/$env:ARCHIVE/lib/onnxruntime.dll"
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch '^CN=Microsoft Corporation,') {
+            throw "Microsoft's library is not validly signed by Microsoft: $($signature.Status) $($signature.SignerCertificate.Subject)"
+          }
+
+      # Applied to the index, which holds the files as committed, and then
+      # checked out, since a Windows checkout converts their line endings.
+      - name: Apply windows.patch
+        run: |
+          git -C onnxruntime apply --cached ../windows.patch
+          git -C onnxruntime checkout -- .
+
+      # Python, CMake and vcpkg as Microsoft's packaging pipeline sets them up,
+      # CMake and vcpkg through its own action with the versions and hashes its
+      # tools/ci_build/run_gh_action.py passes.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install the Python packages Microsoft's build installs
+        run: python -m pip install -r onnxruntime/tools/ci_build/github/windows/python/requirements.txt
+      - uses: microsoft/onnxruntime-github-actions/setup-build-tools@d19341fb036c43a947a2c0e4a53ad4d15e10bc5c # v0.0.9
+        with:
+          cmake-version: '3.31.8'
+          cmake-hash: '807b774fcb12defff8ce869e602fc5b6279d5b7bf7229ebcf3f7490da3f887d516b9c49a00d50f9179e552ed8737d19835a19ef8f366d1ffda1ad6f3352a90c2'
+          vcpkg-version: '2025.08.27'
+          vcpkg-hash: '9a4b32849792e13bee1d24726f073b3881acae4165206ddf1a6378e44a4ddd05b3ee93f55ff46d8e8873b3cbcd06606212989e248f0bd615a5bf365070074079'
+          add-cmake-to-path: 'true'
+          disable-terrapin: 'true'
+
+      # Microsoft's command for its Windows CPU release, the x64 job of
+      # tools/ci_build/github/azure-pipelines/templates/c-api-cpu.yml through
+      # win-ci.yml, less --use_telemetry, Microsoft's internal download mirror
+      # (--use_vcpkg_ms_internal_asset_cache), the Java bindings (--build_java)
+      # and the tests (--enable_onnx_tests), so the one target built is the
+      # library (README.md). The build folder is short, as Microsoft's is.
+      - name: Build
+        run: >-
+          python onnxruntime/tools/ci_build/build.py
+          --build_dir "$RUNNER_TEMP/b"
+          --config RelWithDebInfo
+          --parallel
+          --use_vcpkg
+          --use_binskim_compliant_compile_flags
+          --enable_lto
+          --disable_rtti
+          --skip_submodule_sync
+          --build_shared_lib
+          --update --build
+          --cmake_generator "Visual Studio 17 2022"
+          --use_azure
+          --targets onnxruntime
+
+      # Named and laid out as Microsoft's archive, with the library, its debug
+      # symbols, ONNX Runtime's licence and notices, and what it was built from.
+      - name: Pack the archive
+        run: |
+          built="$(cygpath -u "$RUNNER_TEMP")/b/RelWithDebInfo/RelWithDebInfo"
+          mkdir -p "package/$ARCHIVE/lib"
+          cp "$built/onnxruntime.dll" "$built/onnxruntime.pdb" "package/$ARCHIVE/lib/"
+          cp onnxruntime/LICENSE onnxruntime/ThirdPartyNotices.txt onnxruntime/VERSION_NUMBER README.md "package/$ARCHIVE/"
+          echo "$COMMIT" > "package/$ARCHIVE/GIT_COMMIT_ID"
+          cd package
+          "$(cygpath -u "$SYSTEMROOT")/System32/tar.exe" -a -cf "$ARCHIVE.zip" "$ARCHIVE"
+
+      - name: Check it registers no telemetry provider, where Microsoft's does
+        run: |
+          python check-telemetry.py --expect absent "package/$ARCHIVE/lib/onnxruntime.dll"
+          python check-telemetry.py --expect registered "microsoft/$ARCHIVE/lib/onnxruntime.dll"
+
+      # The same linker and the same imports as Microsoft's, which a change of
+      # toolchain or build configuration would show, under its own name.
+      - name: Check it is built as Microsoft's is
+        run: |
+          vswhere="$(cygpath -u "$(printenv 'ProgramFiles(x86)')")/Microsoft Visual Studio/Installer/vswhere.exe"
+          dumpbin=$(cygpath -u "$("$vswhere" -latest -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | head -n 1 | tr -d '\r')")
+          linker() { "$dumpbin" -nologo -headers "$1" | tr -d '\r' | awk '/linker version/ { print $1 }'; }
+          imports() { "$dumpbin" -nologo -dependents "$1" | tr -d '\r' | grep -E '^ +[^ ]+\.dll$' | sort; }
+          company() { powershell -NoProfile -Command "(Get-Item '$1').VersionInfo.CompanyName" | tr -d '\r'; }
+          ours="package/$ARCHIVE/lib/onnxruntime.dll"
+          theirs="microsoft/$ARCHIVE/lib/onnxruntime.dll"
+          [ "$(linker "$ours")" = "$(linker "$theirs")" ] \
+            || { echo "It was linked by MSVC $(linker "$ours"), and Microsoft's by $(linker "$theirs")."; exit 1; }
+          diff <(imports "$ours") <(imports "$theirs") || { echo "It imports other libraries than Microsoft's."; exit 1; }
+          [ "$(company "$ours")" = "PetriScan Limited" ] || { echo "Its version information names $(company "$ours")."; exit 1; }
+          echo "Linked by MSVC $(linker "$ours") and importing the same libraries, as Microsoft's is."
+          echo "LINKER=$(linker "$ours")" >> "$GITHUB_ENV"
+
+      - name: Write the release notes
+        run: |
+          sha256() { sha256sum "$1" | cut -d ' ' -f 1; }
+          cat > package/notes.md <<EOF
+          ONNX Runtime $VERSION for Windows x64, built from Microsoft's source at [\`${COMMIT:0:7}\`](https://github.com/microsoft/onnxruntime/commit/$COMMIT) with Microsoft's release flags, without its telemetry. How it differs from Microsoft's release, and how it is checked: [README](https://github.com/$GITHUB_REPOSITORY#readme).
+
+          | File | SHA-256 |
+          | --- | --- |
+          | \`$ARCHIVE.zip\` | \`$(sha256 "package/$ARCHIVE.zip")\` |
+          | \`$ARCHIVE/lib/onnxruntime.dll\` | \`$(sha256 "package/$ARCHIVE/lib/onnxruntime.dll")\` |
+
+          Built by [run $GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) with MSVC $LINKER, on the $ImageOS image $ImageVersion.
+          EOF
+          cat package/notes.md
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release
+          path: |
+            package/${{ env.ARCHIVE }}.zip
+            package/notes.md
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    needs: [gate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "ONNX Runtime $VERSION" --notes-file notes.md "onnxruntime-win-x64-$VERSION.zip"
